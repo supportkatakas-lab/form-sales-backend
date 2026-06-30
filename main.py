@@ -1,10 +1,10 @@
 """
 AIフォーム営業リサーチャー - バックエンドサーバー
+（gBizINFO 公式APIを使った企業検索版）
 """
 import os
 import json
 import re
-import time
 import hashlib
 from datetime import datetime, timedelta
 from typing import Optional
@@ -12,7 +12,7 @@ from typing import Optional
 import httpx
 import requests
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from dotenv import load_dotenv
@@ -21,20 +21,42 @@ load_dotenv()
 
 app = FastAPI(title="AIフォーム営業リサーチャー API")
 
-# ─── CORS設定（フロントエンドからのアクセスを許可）───
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # 本番では自分のURLに絞ること
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ─── Anthropic Claude APIクライアント ───
 ANTHROPIC_API_KEY = os.getenv("ANTHROPIC_API_KEY", "")
 SUPABASE_URL      = os.getenv("SUPABASE_URL", "")
 SUPABASE_KEY      = os.getenv("SUPABASE_KEY", "")
+GBIZINFO_TOKEN    = os.getenv("GBIZINFO_TOKEN", "")
 
-# ─── リクエスト/レスポンスの型定義 ───
+GBIZINFO_BASE = "https://info.gbiz.go.jp/hojin/v1/hojin"
+
+PREFECTURE_CODE = {
+    "東京": "13", "大阪": "27", "名古屋": "23", "愛知": "23",
+    "福岡": "40", "札幌": "01", "北海道": "01", "神奈川": "14",
+    "埼玉": "11", "京都": "26", "兵庫": "28", "広島": "34", "仙台": "04", "宮城": "04",
+}
+
+INDUSTRY_KEYWORD_MAP = {
+    "IT・ソフトウェア": "ソフトウェア",
+    "製造業": "製造",
+    "小売・EC": "小売",
+    "不動産": "不動産",
+    "医療・介護": "医療",
+    "教育": "教育",
+    "飲食": "飲食",
+    "建設": "建設",
+    "物流・運輸": "運輸",
+    "金融・保険": "金融",
+    "コンサルティング": "コンサルティング",
+    "広告・マーケティング": "広告",
+}
+
+
 class SearchRequest(BaseModel):
     industry:  str = ""
     region:    str = ""
@@ -47,322 +69,192 @@ class CompanyUpdateRequest(BaseModel):
     memo:         str = ""
 
 
-# ══════════════════════════════════════════════════════
-#  ① 企業検索エンドポイント
-# ══════════════════════════════════════════════════════
 @app.post("/search")
 async def search_companies(req: SearchRequest):
-    """
-    条件に合う企業を収集してスコアリングして返す
-    """
-    query_parts = []
-    if req.industry:  query_parts.append(req.industry)
-    if req.region:    query_parts.append(req.region)
-    if req.keyword:   query_parts.append(req.keyword)
-    if req.employees: query_parts.append(f"従業員{req.employees}名")
-    query_parts.append("お問い合わせ 企業")
-    query = " ".join(query_parts)
-    print(f"[search_companies] query='{query}'")
+    if not GBIZINFO_TOKEN:
+        return {
+            "companies": [],
+            "total": 0,
+            "error": "GBIZINFO_TOKEN が設定されていません。Renderの環境変数を確認してください。",
+        }
 
-    # 1. Google検索で企業URLを収集
-    urls = await google_search(query, num=15)
-    print(f"[search_companies] found {len(urls)} candidate urls")
+    candidates = await gbizinfo_search(req)
+    print(f"[search_companies] gBizINFO candidates: {len(candidates)}")
 
-    # 2. 各URLから企業情報を取得
     companies = []
-    for url in urls:
+    for c in candidates:
         try:
-            company = await extract_company_info(url, req)
-            if company:
-                # 3. Supabaseで30日キャッシュ確認
-                cached = await get_cached_company(company["name"])
-                if cached:
-                    company = {**company, **cached, "_cached": True}
-                else:
-                    # 4. フォーム探索
-                    form_info = await find_contact_form(url)
-                    company.update(form_info)
-                    # 5. AIスコアリング
-                    score_result = await ai_score_company(company)
-                    company.update(score_result)
-                    # 6. Supabaseに保存
-                    await save_company(company)
-                companies.append(company)
+            company = build_company_record(c, req)
+            if not company.get("hp"):
+                print(f"[search_companies] skip (no url): {company.get('name')}")
+                continue
+
+            cached = await get_cached_company(company["name"])
+            if cached:
+                company = {**company, **cached, "_cached": True}
             else:
-                print(f"[search_companies] skipped (no name extracted): {url}")
+                form_info = await find_contact_form(company["hp"])
+                company.update(form_info)
+                score_result = await ai_score_company(company)
+                company.update(score_result)
+                await save_company(company)
+
+            companies.append(company)
         except Exception as e:
-            print(f"[search_companies] error processing {url}: {type(e).__name__}: {e}")
+            print(f"[search_companies] error processing {c.get('name')}: {type(e).__name__}: {e}")
             continue
 
     print(f"[search_companies] final company count: {len(companies)}")
-    # スコア順に並べて返す
     companies.sort(key=lambda x: x.get("score", 0), reverse=True)
     return {"companies": companies, "total": len(companies)}
 
 
-# ══════════════════════════════════════════════════════
-#  ② 企業DB取得エンドポイント
-# ══════════════════════════════════════════════════════
 @app.get("/companies")
 async def get_companies():
-    """保存済み企業一覧を返す"""
     companies = await fetch_all_companies()
     return {"companies": companies}
 
 
-# ══════════════════════════════════════════════════════
-#  ③ 営業ステータス更新エンドポイント
-# ══════════════════════════════════════════════════════
 @app.post("/update-status")
 async def update_status(req: CompanyUpdateRequest):
-    """営業ステータスとメモを更新する"""
-    result = await update_company_status(
-        req.company_id,
-        req.sales_status,
-        req.memo
-    )
+    result = await update_company_status(req.company_id, req.sales_status, req.memo)
     return {"success": True, "updated": result}
 
 
-# ══════════════════════════════════════════════════════
-#  ④ 法人番号検索エンドポイント（国税庁API）
-# ══════════════════════════════════════════════════════
-@app.get("/corp-number/{company_name}")
-async def get_corp_number(company_name: str):
-    """国税庁APIで法人番号を取得する"""
-    corp_no = await fetch_corp_number(company_name)
-    return {"corp_number": corp_no}
-
-
-# ══════════════════════════════════════════════════════
-#  ⑤ ヘルスチェック（サーバーが動いてるか確認用）
-# ══════════════════════════════════════════════════════
 @app.get("/health")
 def health_check():
-    return {"status": "ok", "timestamp": datetime.now().isoformat()}
-
-
-# ══════════════════════════════════════════════════════
-#  ⑥ 【一時デバッグ用】検索結果のHTMLを直接確認する
-#     原因調査が終わったら削除してください
-# ══════════════════════════════════════════════════════
-@app.get("/debug-search")
-def debug_search(q: str = "IT 東京 お問い合わせ", engine: str = "bing"):
-    headers_bing = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept-Language": "ja-JP,ja;q=0.9",
+    return {
+        "status": "ok",
+        "timestamp": datetime.now().isoformat(),
+        "gbizinfo_token_set": bool(GBIZINFO_TOKEN),
     }
-    headers_ddg = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
 
-    if engine == "ddg":
-        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(q)}"
-        resp = requests.get(url, headers=headers_ddg, timeout=10)
+
+@app.get("/debug-gbiz")
+def debug_gbiz(name: str = "ソフトウェア", prefecture: str = "", limit: int = 5):
+    params = {"name": name, "limit": limit}
+    if prefecture:
+        params["prefecture"] = prefecture
+    headers = {"Accept": "application/json", "X-hojinInfo-api-token": GBIZINFO_TOKEN}
+    resp = requests.get(GBIZINFO_BASE, headers=headers, params=params, timeout=15)
+    return {
+        "request_url": resp.url,
+        "status_code": resp.status_code,
+        "body": safe_json(resp),
+    }
+
+
+def safe_json(resp):
+    try:
+        return resp.json()
+    except Exception:
+        return resp.text[:2000]
+
+
+async def gbizinfo_search(req: SearchRequest) -> list:
+    name_query = ""
+    if req.industry:
+        name_query = INDUSTRY_KEYWORD_MAP.get(req.industry, req.industry)
+    elif req.keyword:
+        name_query = req.keyword
     else:
-        url = f"https://www.bing.com/search?q={requests.utils.quote(q)}&count=30&mkt=ja-JP"
-        resp = requests.get(url, headers=headers_bing, timeout=12)
+        name_query = "株式会社"
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    all_links = [a.get("href") for a in soup.find_all("a", href=True)]
-    http_links = [h for h in all_links if h and h.startswith("http")]
+    params = {"name": name_query, "limit": 20}
+
+    prefecture_code = PREFECTURE_CODE.get(req.region, "")
+    if prefecture_code:
+        params["prefecture"] = prefecture_code
+
+    headers = {"Accept": "application/json", "X-hojinInfo-api-token": GBIZINFO_TOKEN}
+
+    try:
+        resp = requests.get(GBIZINFO_BASE, headers=headers, params=params, timeout=15)
+        print(f"[gbizinfo] status={resp.status_code} url={resp.url}")
+        if resp.status_code != 200:
+            print(f"[gbizinfo] non-200 body: {resp.text[:500]}")
+            return []
+        data = resp.json()
+        infos = data.get("hojin-infos", [])
+        print(f"[gbizinfo] got {len(infos)} results")
+        return infos
+    except Exception as e:
+        print(f"[gbizinfo] error: {type(e).__name__}: {e}")
+        return []
+
+
+def build_company_record(c: dict, req: SearchRequest) -> dict:
+    name = c.get("name") or ""
+    corp_no = c.get("corporate_number") or ""
+    hp = c.get("company_url") or ""
+    employees = c.get("employee_number") or parse_employee_range(req.employees)
+    location = c.get("location") or ""
+
+    company_id = hashlib.md5((corp_no or name).encode()).hexdigest()[:12]
 
     return {
-        "requested_url": url,
-        "status_code": resp.status_code,
-        "html_length": len(resp.text),
-        "html_snippet_start": resp.text[:1500],
-        "total_a_tags": len(all_links),
-        "http_links_count": len(http_links),
-        "sample_http_links": http_links[:20],
-    }
-
-
-# ══════════════════════════════════════════════════════
-#  内部関数群
-# ══════════════════════════════════════════════════════
-
-async def google_search(query: str, num: int = 15) -> list[str]:
-    """
-    企業URLリストを取得する。
-    DuckDuckGoはクラウドサーバーのIPからブロックされやすいため、
-    Bing検索（HTML版）をメインに使用し、失敗時はDuckDuckGoにフォールバックする。
-    """
-    urls = []
-
-    # ── ① Bing検索を試す ──
-    try:
-        urls = bing_search(query, num)
-        print(f"[search] Bing returned {len(urls)} urls for query='{query}'")
-        if urls:
-            return urls[:num]
-    except Exception as e:
-        print(f"[search] Bing search error: {type(e).__name__}: {e}")
-
-    # ── ② ダメならDuckDuckGoにフォールバック ──
-    try:
-        urls = duckduckgo_search(query, num)
-        print(f"[search] DuckDuckGo returned {len(urls)} urls for query='{query}'")
-    except Exception as e:
-        print(f"[search] DuckDuckGo search error: {type(e).__name__}: {e}")
-
-    return urls[:num]
-
-
-def bing_search(query: str, num: int) -> list[str]:
-    """Bing検索のHTML結果からURLを抽出する（リンク総当たり方式）"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
-        "Accept-Language": "ja-JP,ja;q=0.9",
-    }
-    search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=30&mkt=ja-JP"
-    resp = requests.get(search_url, headers=headers, timeout=12)
-    print(f"[bing] status={resp.status_code} length={len(resp.text)}")
-    resp.raise_for_status()
-
-    return extract_result_links(resp.text, skip_domains=[
-        "bing.", "microsoft.", "google.", "wikipedia.", "youtube.",
-        "twitter.", "x.com", "facebook.", "instagram.", "indeed.com",
-        "msn.com", "live.com",
-    ], num=num)
-
-
-def duckduckgo_search(query: str, num: int) -> list[str]:
-    """DuckDuckGo検索のHTML結果からURLを抽出する（フォールバック・リンク総当たり方式）"""
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-    }
-    search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-    resp = requests.get(search_url, headers=headers, timeout=10)
-    print(f"[ddg] status={resp.status_code} length={len(resp.text)}")
-    resp.raise_for_status()
-
-    return extract_result_links(resp.text, skip_domains=[
-        "duckduckgo.", "google.", "wikipedia.", "youtube.", "twitter.", "facebook.",
-    ], num=num)
-
-
-def extract_result_links(html: str, skip_domains: list[str], num: int) -> list[str]:
-    """
-    検索結果ページのHTMLから、外部サイトへのリンクを総当たりで抽出する。
-    CSSクラス名に依存しないため、検索エンジン側のデザイン変更に強い。
-    """
-    soup = BeautifulSoup(html, "html.parser")
-    urls = []
-    seen = set()
-
-    for a in soup.find_all("a", href=True):
-        href = a["href"]
-
-        # DuckDuckGoはリンクが /l/?uddg=実際のURL の形でラップされていることがある
-        if "uddg=" in href:
-            m = re.search(r"uddg=([^&]+)", href)
-            if m:
-                href = requests.utils.unquote(m.group(1))
-
-        # Bingはリンクが内部トラッキングURL（/ck/a?...）の場合があるためスキップ
-        if "bing.com/ck/" in href:
-            continue
-
-        if not href.startswith("http"):
-            continue
-        if any(skip in href for skip in skip_domains):
-            continue
-        if href in seen:
-            continue
-
-        seen.add(href)
-        urls.append(href)
-        if len(urls) >= num:
-            break
-
-    return urls
-
-
-
-async def extract_company_info(url: str, req: SearchRequest) -> Optional[dict]:
-    """
-    企業サイトのトップページから基本情報を取得する
-    """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SalesBot/1.0)"}
-    try:
-        resp = requests.get(url, headers=headers, timeout=8)
-        resp.raise_for_status()
-        soup = BeautifulSoup(resp.text, "html.parser")
-
-        # 会社名を取得（titleタグまたはh1）
-        name = ""
-        title_tag = soup.find("title")
-        if title_tag:
-            name = title_tag.text.strip().split("|")[0].split("｜")[0].split("-")[0].strip()
-        if not name:
-            h1 = soup.find("h1")
-            if h1:
-                name = h1.text.strip()
-        if not name or len(name) > 50:
-            return None
-
-        # メタ情報・電話番号を取得
-        tel = extract_phone(soup)
-        address = extract_address(soup)
-
-        # 会社IDを生成（URL のハッシュ）
-        company_id = hashlib.md5(url.encode()).hexdigest()[:12]
-
-        return {
-            "id": company_id,
-            "name": name,
-            "hp": url,
-            "tel": tel,
-            "address": address,
-            "industry": req.industry or "不明",
-            "region": req.region or extract_region(address),
-            "employees": parse_employee_range(req.employees),
-            "corp_no": "",
-            "score": 0,
-            "has_form": False,
-            "form_url": "",
-            "form_type": "",
-            "sales_ok": False,
-            "reason": "",
-            "form_fields": [],
-            "required_fields": [],
-            "has_recaptcha": False,
-            "has_confirm_page": False,
-            "has_checkbox": False,
-            "sales_status": "未営業",
-            "last_contact": None,
-            "memo": "",
-            "log": [],
-            "updated_at": datetime.now().isoformat(),
-            "_cached": False,
-        }
-    except Exception as e:
-        print(f"[extract] failed for {url}: {type(e).__name__}: {e}")
-        return None
-
-
-async def find_contact_form(base_url: str) -> dict:
-    """
-    企業サイトのフォームURLを探索する
-    トップ・会社概要・フッター・サイトマップを巡回
-    """
-    headers = {"User-Agent": "Mozilla/5.0 (compatible; SalesBot/1.0)"}
-    form_keywords = ["contact", "inquiry", "お問い合わせ", "ご相談", "問い合わせ", "contact-us"]
-    exclude_keywords = ["recruit", "採用", "ir-", "investor", "login", "signin"]
-
-    result = {
-        "has_form": False,
+        "id": company_id,
+        "name": name,
+        "corp_no": corp_no,
+        "address": location,
+        "tel": "",
+        "hp": normalize_url(hp),
         "form_url": "",
+        "employees": employees,
+        "industry": req.industry or (c.get("business_summary") or "不明")[:20],
+        "region": req.region or extract_region(location),
+        "has_form": False,
         "form_type": "",
         "sales_ok": False,
         "no_sales_note": False,
+        "score": 0,
+        "reason": "",
         "form_fields": [],
         "required_fields": [],
         "has_recaptcha": False,
         "has_confirm_page": False,
         "has_checkbox": False,
+        "sales_status": "未営業",
+        "last_contact": None,
+        "memo": "",
+        "log": [],
+        "updated_at": datetime.now().isoformat(),
+        "_cached": False,
     }
 
-    # 巡回するページ候補
+
+def normalize_url(url: str) -> str:
+    if not url:
+        return ""
+    url = url.strip()
+    if not url.startswith("http"):
+        url = "https://" + url
+    return url
+
+
+def extract_region(address: str) -> str:
+    for pref in ["東京", "大阪", "名古屋", "愛知", "福岡", "北海道", "神奈川", "埼玉", "京都", "兵庫", "広島", "宮城"]:
+        if pref in address:
+            return pref
+    return ""
+
+
+def parse_employee_range(emp_str: str) -> int:
+    ranges = {"1-10": 5, "11-50": 30, "51-200": 100, "201-500": 300, "501+": 600, "": 50}
+    return ranges.get(emp_str, 50)
+
+
+async def find_contact_form(base_url: str) -> dict:
+    headers = {"User-Agent": "Mozilla/5.0 (compatible; SalesBot/1.0)"}
+    form_keywords = ["contact", "inquiry", "お問い合わせ", "ご相談", "問い合わせ", "contact-us"]
+    exclude_keywords = ["recruit", "採用", "ir-", "investor", "login", "signin"]
+
+    result = {
+        "has_form": False, "form_url": "", "form_type": "", "sales_ok": False,
+        "no_sales_note": False, "form_fields": [], "required_fields": [],
+        "has_recaptcha": False, "has_confirm_page": False, "has_checkbox": False,
+    }
+
     candidate_paths = ["", "/contact", "/inquiry", "/about", "/company"]
     visited = set()
 
@@ -376,12 +268,10 @@ async def find_contact_form(base_url: str) -> dict:
             resp = requests.get(url, headers=headers, timeout=6)
             soup = BeautifulSoup(resp.text, "html.parser")
 
-            # 営業禁止表記チェック
             text = soup.get_text()
             if any(kw in text for kw in ["営業はお断り", "勧誘お断り", "営業電話お断り", "営業禁止"]):
                 result["no_sales_note"] = True
 
-            # フォームを含むリンクを探す
             for a in soup.find_all("a", href=True):
                 href = a["href"]
                 link_text = a.get_text()
@@ -390,7 +280,6 @@ async def find_contact_form(base_url: str) -> dict:
                 if any(kw in href.lower() or kw in link_text for kw in form_keywords):
                     if any(ex in href.lower() for ex in exclude_keywords):
                         continue
-                    # フォームページを解析
                     form_detail = await analyze_form_page(full_url)
                     if form_detail["has_form"]:
                         result.update(form_detail)
@@ -400,7 +289,6 @@ async def find_contact_form(base_url: str) -> dict:
                             result["form_type"] not in ["採用", "IR・その他"]
                         return result
 
-            # ページ内にフォームタグがあるか確認
             if soup.find("form"):
                 form_detail = await analyze_form_page(url)
                 if form_detail["has_form"]:
@@ -411,27 +299,19 @@ async def find_contact_form(base_url: str) -> dict:
                         result["form_type"] not in ["採用", "IR・その他"]
                     return result
 
-        except Exception:
+        except Exception as e:
+            print(f"[find_contact_form] {url} failed: {type(e).__name__}: {e}")
             continue
 
     return result
 
 
 async def analyze_form_page(url: str) -> dict:
-    """
-    フォームページの構造を解析する
-    """
     headers = {"User-Agent": "Mozilla/5.0 (compatible; SalesBot/1.0)"}
     result = {
-        "has_form": False,
-        "form_type": "",
-        "form_fields": [],
-        "required_fields": [],
-        "has_recaptcha": False,
-        "has_confirm_page": False,
-        "has_checkbox": False,
+        "has_form": False, "form_type": "", "form_fields": [], "required_fields": [],
+        "has_recaptcha": False, "has_confirm_page": False, "has_checkbox": False,
     }
-
     try:
         resp = requests.get(url, headers=headers, timeout=6)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -440,15 +320,11 @@ async def analyze_form_page(url: str) -> dict:
             return result
 
         result["has_form"] = True
-
-        # ページタイトルからフォーム種別を判定
         title = soup.find("title")
         page_text = (title.text if title else "") + soup.get_text()[:500]
         result["form_type"] = classify_form_type(page_text)
 
-        # 入力フィールドを取得
-        fields = []
-        required = []
+        fields, required = [], []
         for inp in form.find_all(["input", "textarea", "select"]):
             label = get_field_label(soup, inp)
             if label and label not in ["送信", "確認", "戻る", "リセット"]:
@@ -458,29 +334,19 @@ async def analyze_form_page(url: str) -> dict:
 
         result["form_fields"] = fields[:10]
         result["required_fields"] = required
-
-        # reCAPTCHA チェック
         result["has_recaptcha"] = bool(
             soup.find(class_=re.compile("recaptcha", re.I)) or
             soup.find("script", src=re.compile("recaptcha", re.I))
         )
-
-        # 確認画面チェック
-        result["has_confirm_page"] = any(
-            kw in page_text for kw in ["確認画面", "confirm", "内容確認"]
-        )
-
-        # チェックボックスチェック
+        result["has_confirm_page"] = any(kw in page_text for kw in ["確認画面", "confirm", "内容確認"])
         result["has_checkbox"] = bool(form.find("input", {"type": "checkbox"}))
-
-    except Exception:
-        pass
+    except Exception as e:
+        print(f"[analyze_form_page] {url} failed: {type(e).__name__}: {e}")
 
     return result
 
 
 def classify_form_type(text: str) -> str:
-    """テキストからフォーム種別を判定"""
     if any(kw in text for kw in ["採用", "エントリー", "応募", "求人"]):
         return "採用"
     if any(kw in text for kw in ["IR", "投資家", "株主"]):
@@ -495,7 +361,6 @@ def classify_form_type(text: str) -> str:
 
 
 def get_field_label(soup, inp) -> str:
-    """inputに対応するラベルテキストを取得"""
     inp_id = inp.get("id")
     if inp_id:
         label = soup.find("label", {"for": inp_id})
@@ -516,45 +381,8 @@ def get_field_label(soup, inp) -> str:
     return ""
 
 
-def extract_phone(soup) -> str:
-    """電話番号を抽出"""
-    text = soup.get_text()
-    pattern = r"0\d{1,4}[-\s]?\d{1,4}[-\s]?\d{4}"
-    match = re.search(pattern, text)
-    return match.group(0) if match else ""
-
-
-def extract_address(soup) -> str:
-    """住所を抽出"""
-    text = soup.get_text()
-    pattern = r"[〒\d]{3}-?\d{4}[\s\S]{0,50}[都道府県][\s\S]{0,100}[0-9１-９一二三四五六七八九十]+[丁目番地号]"
-    match = re.search(pattern, text)
-    return match.group(0).strip()[:80] if match else ""
-
-
-def extract_region(address: str) -> str:
-    """住所から都道府県を抽出"""
-    for pref in ["東京", "大阪", "名古屋", "福岡", "神奈川", "埼玉", "京都", "兵庫", "広島", "仙台"]:
-        if pref in address:
-            return pref
-    return ""
-
-
-def parse_employee_range(emp_str: str) -> int:
-    """従業員数レンジから代表値を返す"""
-    ranges = {
-        "1-10": 5, "11-50": 30, "51-200": 100,
-        "201-500": 300, "501+": 600, "": 50
-    }
-    return ranges.get(emp_str, 50)
-
-
 async def ai_score_company(company: dict) -> dict:
-    """
-    Claude APIで企業の営業優先度をスコアリングする
-    """
     if not ANTHROPIC_API_KEY:
-        # APIキーがない場合はルールベースでスコアリング
         return rule_based_score(company)
 
     prompt = f"""
@@ -572,7 +400,6 @@ reCAPTCHA: {'あり' if company.get('has_recaptcha') else 'なし'}
 以下のJSON形式のみで返答してください（説明文不要）:
 {{"score": 1〜5の整数, "reason": "判定理由を1〜2文で"}}
 """
-
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.post(
@@ -592,27 +419,20 @@ reCAPTCHA: {'あり' if company.get('has_recaptcha') else 'なし'}
             data = resp.json()
             text = data["content"][0]["text"].strip()
             parsed = json.loads(text)
-            return {
-                "score": int(parsed.get("score", 1)),
-                "reason": parsed.get("reason", ""),
-            }
+            return {"score": int(parsed.get("score", 1)), "reason": parsed.get("reason", "")}
     except Exception as e:
-        print(f"AI scoring error: {e}")
+        print(f"[ai_score_company] error: {type(e).__name__}: {e}")
         return rule_based_score(company)
 
 
 def rule_based_score(company: dict) -> dict:
-    """AIなしのルールベーススコアリング（フォールバック）"""
-    score = 0
-    reasons = []
-
     if not company.get("has_form"):
         return {"score": 0, "reason": "フォームが見つからないため対象外"}
-
     if company.get("no_sales_note"):
         return {"score": 0, "reason": "営業禁止の記載があるため対象外"}
 
-    score += 1
+    score = 1
+    reasons = []
     form_type = company.get("form_type", "")
     if form_type in ["お問い合わせ", "ご相談"]:
         score += 2
@@ -632,33 +452,8 @@ def rule_based_score(company: dict) -> dict:
         score = min(score + 1, 5)
         reasons.append("reCAPTCHAなしで送信しやすい")
 
-    return {
-        "score": min(score, 5),
-        "reason": "・".join(reasons) if reasons else "基本条件を満たしています",
-    }
+    return {"score": min(score, 5), "reason": "・".join(reasons) if reasons else "基本条件を満たしています"}
 
-
-async def fetch_corp_number(company_name: str) -> str:
-    """国税庁法人番号APIで法人番号を取得"""
-    try:
-        url = "https://api.houjin-bangou.nta.go.jp/4/name"
-        params = {
-            "id": os.getenv("NTA_API_KEY", ""),  # 国税庁APIキー（無料取得可）
-            "name": company_name,
-            "type": "12",
-        }
-        resp = requests.get(url, params=params, timeout=5)
-        data = resp.json()
-        if data.get("corporations"):
-            return data["corporations"][0].get("corporateNumber", "")
-    except Exception:
-        pass
-    return ""
-
-
-# ══════════════════════════════════════════════════════
-#  Supabase連携関数
-# ══════════════════════════════════════════════════════
 
 def get_supabase_headers():
     return {
@@ -669,8 +464,7 @@ def get_supabase_headers():
     }
 
 
-async def get_cached_company(name: str) -> Optional[dict]:
-    """30日以内に取得済みの企業データを返す"""
+async def get_cached_company(name: str):
     if not SUPABASE_URL:
         return None
     try:
@@ -684,13 +478,11 @@ async def get_cached_company(name: str) -> Optional[dict]:
 
 
 async def save_company(company: dict) -> bool:
-    """企業データをSupabaseに保存（upsert）"""
     if not SUPABASE_URL:
         return False
     try:
         url = f"{SUPABASE_URL}/rest/v1/companies"
         headers = {**get_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
-        # JSON serializable に変換
         data = {k: v for k, v in company.items() if not k.startswith("_")}
         data["form_fields"] = json.dumps(data.get("form_fields", []))
         data["required_fields"] = json.dumps(data.get("required_fields", []))
@@ -698,12 +490,11 @@ async def save_company(company: dict) -> bool:
         requests.post(url, headers=headers, json=data, timeout=5)
         return True
     except Exception as e:
-        print(f"Supabase save error: {e}")
+        print(f"[save_company] error: {e}")
         return False
 
 
 async def fetch_all_companies() -> list:
-    """Supabaseから全企業データを取得"""
     if not SUPABASE_URL:
         return []
     try:
@@ -723,7 +514,6 @@ async def fetch_all_companies() -> list:
 
 
 async def update_company_status(company_id: str, status: str, memo: str) -> bool:
-    """営業ステータスを更新"""
     if not SUPABASE_URL:
         return False
     try:
