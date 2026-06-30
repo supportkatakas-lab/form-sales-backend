@@ -85,9 +85,17 @@ async def search_companies(req: SearchRequest):
     for c in candidates:
         try:
             company = build_company_record(c, req)
+
+            # gBizINFOにURLが登録されていない場合は、会社名から検索して補う
             if not company.get("hp"):
-                print(f"[search_companies] skip (no url): {company.get('name')}")
-                continue
+                guessed_url = await guess_company_url(company["name"])
+                if guessed_url:
+                    company["hp"] = guessed_url
+                    print(f"[search_companies] guessed url for {company['name']}: {guessed_url}")
+                else:
+                    print(f"[search_companies] skip (no url found): {company.get('name')}")
+                    companies.append(company)  # URLなしでも基本情報だけは表示する
+                    continue
 
             cached = await get_cached_company(company["name"])
             if cached:
@@ -181,6 +189,45 @@ async def gbizinfo_search(req: SearchRequest) -> list:
     except Exception as e:
         print(f"[gbizinfo] error: {type(e).__name__}: {e}")
         return []
+
+
+async def guess_company_url(company_name: str) -> str:
+    """
+    gBizINFOにURLが登録されていない場合、会社名でBing検索して
+    公式サイトらしきURLを1件だけ推測する。
+    検索結果一覧の取得ではなく単発の名寄せ用途のため、
+    Bingのbot対策に引っかかってもアプリ全体は壊れない設計。
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ja-JP,ja;q=0.9",
+    }
+    skip_domains = [
+        "bing.", "microsoft.", "google.", "wikipedia.", "youtube.", "twitter.", "x.com",
+        "facebook.", "instagram.", "indeed.com", "houjin-bangou.nta.go.jp", "gbiz.go.jp",
+        "mapfan.", "mapion.", "navitime.", "goo.ne.jp/map", "townpage.", "ecareernavi.",
+    ]
+    query = f"{company_name} 公式サイト"
+    search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&mkt=ja-JP"
+
+    try:
+        resp = requests.get(search_url, headers=headers, timeout=8)
+        if resp.status_code != 200:
+            return ""
+        soup = BeautifulSoup(resp.text, "html.parser")
+        for a in soup.find_all("a", href=True):
+            href = a["href"]
+            if "bing.com/ck/" in href:
+                continue
+            if not href.startswith("http"):
+                continue
+            if any(skip in href for skip in skip_domains):
+                continue
+            return href
+    except Exception as e:
+        print(f"[guess_company_url] {company_name} failed: {type(e).__name__}: {e}")
+
+    return ""
 
 
 def build_company_record(c: dict, req: SearchRequest) -> dict:
