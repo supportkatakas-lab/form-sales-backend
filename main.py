@@ -180,9 +180,11 @@ async def gbizinfo_search(req: SearchRequest) -> list:
 
     # 既存の検索済み企業名一覧を取得（重複除外用）
     existing_names = await get_existing_company_names()
+    print(f"[gbizinfo] query_key='{query_key}' existing_names_count={len(existing_names)}")
 
     collected = []
     start_page = await get_next_page(query_key)
+    print(f"[gbizinfo] start_page={start_page}")
     page = start_page
     max_pages_to_try = 5  # 無限ループ防止（5ページ分=最大100件まで探索）
 
@@ -542,11 +544,15 @@ def rule_based_score(company: dict) -> dict:
 
 
 def get_supabase_headers():
+    """
+    GET（データ取得）用のヘッダー。
+    'Prefer: return=minimal' はPOST/PATCH専用のオプションのため、
+    GETには付けない（付けるとSupabaseが結果を返さなくなる）。
+    """
     return {
         "apikey": SUPABASE_KEY,
         "Authorization": f"Bearer {SUPABASE_KEY}",
         "Content-Type": "application/json",
-        "Prefer": "return=minimal",
     }
 
 
