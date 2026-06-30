@@ -143,6 +143,40 @@ def health_check():
 
 
 # ══════════════════════════════════════════════════════
+#  ⑥ 【一時デバッグ用】検索結果のHTMLを直接確認する
+#     原因調査が終わったら削除してください
+# ══════════════════════════════════════════════════════
+@app.get("/debug-search")
+def debug_search(q: str = "IT 東京 お問い合わせ", engine: str = "bing"):
+    headers_bing = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ja-JP,ja;q=0.9",
+    }
+    headers_ddg = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+
+    if engine == "ddg":
+        url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(q)}"
+        resp = requests.get(url, headers=headers_ddg, timeout=10)
+    else:
+        url = f"https://www.bing.com/search?q={requests.utils.quote(q)}&count=30&mkt=ja-JP"
+        resp = requests.get(url, headers=headers_bing, timeout=12)
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    all_links = [a.get("href") for a in soup.find_all("a", href=True)]
+    http_links = [h for h in all_links if h and h.startswith("http")]
+
+    return {
+        "requested_url": url,
+        "status_code": resp.status_code,
+        "html_length": len(resp.text),
+        "html_snippet_start": resp.text[:1500],
+        "total_a_tags": len(all_links),
+        "http_links_count": len(http_links),
+        "sample_http_links": http_links[:20],
+    }
+
+
+# ══════════════════════════════════════════════════════
 #  内部関数群
 # ══════════════════════════════════════════════════════
 
