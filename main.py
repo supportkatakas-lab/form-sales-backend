@@ -174,35 +174,25 @@ async def google_search(query: str, num: int = 15) -> list[str]:
 
 
 def bing_search(query: str, num: int) -> list[str]:
-    """Bing検索のHTML結果からURLを抽出する"""
+    """Bing検索のHTML結果からURLを抽出する（リンク総当たり方式）"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
         "Accept-Language": "ja-JP,ja;q=0.9",
     }
-    search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=30"
+    search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=30&mkt=ja-JP"
     resp = requests.get(search_url, headers=headers, timeout=12)
     print(f"[bing] status={resp.status_code} length={len(resp.text)}")
     resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    urls = []
-    skip_domains = ["bing.", "microsoft.", "google.", "wikipedia.", "youtube.",
-                     "twitter.", "x.com", "facebook.", "instagram.", "indeed.com"]
-
-    # Bingの検索結果リンクは <li class="b_algo"> の中の <h2><a href="...">
-    for li in soup.select("li.b_algo"):
-        a = li.find("a", href=True)
-        if not a:
-            continue
-        href = a["href"]
-        if href.startswith("http") and not any(skip in href for skip in skip_domains):
-            urls.append(href)
-
-    return urls[:num]
+    return extract_result_links(resp.text, skip_domains=[
+        "bing.", "microsoft.", "google.", "wikipedia.", "youtube.",
+        "twitter.", "x.com", "facebook.", "instagram.", "indeed.com",
+        "msn.com", "live.com",
+    ], num=num)
 
 
 def duckduckgo_search(query: str, num: int) -> list[str]:
-    """DuckDuckGo検索のHTML結果からURLを抽出する（フォールバック用）"""
+    """DuckDuckGo検索のHTML結果からURLを抽出する（フォールバック・リンク総当たり方式）"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
@@ -211,16 +201,47 @@ def duckduckgo_search(query: str, num: int) -> list[str]:
     print(f"[ddg] status={resp.status_code} length={len(resp.text)}")
     resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    return extract_result_links(resp.text, skip_domains=[
+        "duckduckgo.", "google.", "wikipedia.", "youtube.", "twitter.", "facebook.",
+    ], num=num)
+
+
+def extract_result_links(html: str, skip_domains: list[str], num: int) -> list[str]:
+    """
+    検索結果ページのHTMLから、外部サイトへのリンクを総当たりで抽出する。
+    CSSクラス名に依存しないため、検索エンジン側のデザイン変更に強い。
+    """
+    soup = BeautifulSoup(html, "html.parser")
     urls = []
-    skip_domains = ["google.", "wikipedia.", "youtube.", "twitter.", "facebook."]
+    seen = set()
 
-    for a in soup.select(".result__a, .result__url"):
-        href = a.get("href", "")
-        if href.startswith("http") and not any(skip in href for skip in skip_domains):
-            urls.append(href)
+    for a in soup.find_all("a", href=True):
+        href = a["href"]
 
-    return urls[:num]
+        # DuckDuckGoはリンクが /l/?uddg=実際のURL の形でラップされていることがある
+        if "uddg=" in href:
+            m = re.search(r"uddg=([^&]+)", href)
+            if m:
+                href = requests.utils.unquote(m.group(1))
+
+        # Bingはリンクが内部トラッキングURL（/ck/a?...）の場合があるためスキップ
+        if "bing.com/ck/" in href:
+            continue
+
+        if not href.startswith("http"):
+            continue
+        if any(skip in href for skip in skip_domains):
+            continue
+        if href in seen:
+            continue
+
+        seen.add(href)
+        urls.append(href)
+        if len(urls) >= num:
+            break
+
+    return urls
+
 
 
 async def extract_company_info(url: str, req: SearchRequest) -> Optional[dict]:
