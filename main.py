@@ -160,6 +160,11 @@ def safe_json(resp):
 
 
 async def gbizinfo_search(req: SearchRequest) -> list:
+    """
+    gBizINFO APIで企業候補を検索する。
+    同じ条件で再検索された場合は、前回の続きのページから取得することで、
+    既に収集済みの企業との重複をできるだけ避ける。
+    """
     name_query = ""
     if req.industry:
         name_query = INDUSTRY_KEYWORD_MAP.get(req.industry, req.industry)
@@ -168,27 +173,61 @@ async def gbizinfo_search(req: SearchRequest) -> list:
     else:
         name_query = "株式会社"
 
-    params = {"name": name_query, "limit": 20}
-
     prefecture_code = PREFECTURE_CODE.get(req.region, "")
-    if prefecture_code:
-        params["prefecture"] = prefecture_code
+    query_key = build_query_key(req)
 
     headers = {"Accept": "application/json", "X-hojinInfo-api-token": GBIZINFO_TOKEN}
 
-    try:
-        resp = requests.get(GBIZINFO_BASE, headers=headers, params=params, timeout=15)
-        print(f"[gbizinfo] status={resp.status_code} url={resp.url}")
-        if resp.status_code != 200:
-            print(f"[gbizinfo] non-200 body: {resp.text[:500]}")
-            return []
-        data = resp.json()
-        infos = data.get("hojin-infos", [])
-        print(f"[gbizinfo] got {len(infos)} results")
-        return infos
-    except Exception as e:
-        print(f"[gbizinfo] error: {type(e).__name__}: {e}")
-        return []
+    # 既存の検索済み企業名一覧を取得（重複除外用）
+    existing_names = await get_existing_company_names()
+
+    collected = []
+    start_page = await get_next_page(query_key)
+    page = start_page
+    max_pages_to_try = 5  # 無限ループ防止（5ページ分=最大100件まで探索）
+
+    for _ in range(max_pages_to_try):
+        params = {"name": name_query, "limit": 20, "page": page}
+        if prefecture_code:
+            params["prefecture"] = prefecture_code
+
+        try:
+            resp = requests.get(GBIZINFO_BASE, headers=headers, params=params, timeout=15)
+            print(f"[gbizinfo] page={page} status={resp.status_code} url={resp.url}")
+            if resp.status_code != 200:
+                print(f"[gbizinfo] non-200 body: {resp.text[:500]}")
+                break
+            data = resp.json()
+            infos = data.get("hojin-infos", [])
+            print(f"[gbizinfo] page={page} got {len(infos)} results")
+
+            if not infos:
+                # これ以上データがない場合はページを1に戻して終了
+                page = 1
+                break
+
+            # 既にDBにある企業名は除外
+            new_infos = [i for i in infos if (i.get("name") or "") not in existing_names]
+            collected.extend(new_infos)
+
+            page += 1
+            if len(collected) >= 20:
+                break
+        except Exception as e:
+            print(f"[gbizinfo] error: {type(e).__name__}: {e}")
+            break
+
+    # 次回はこのページから再開する
+    await set_next_page(query_key, page)
+    print(f"[gbizinfo] collected {len(collected)} new companies (pages {start_page}..{page-1})")
+
+    return collected[:20]
+
+
+def build_query_key(req: SearchRequest) -> str:
+    """検索条件から進捗管理用の一意なキーを作る"""
+    parts = [req.industry or "-", req.region or "-", req.employees or "-", req.keyword or "-"]
+    return "|".join(parts)
 
 
 async def guess_company_url(company_name: str) -> str:
@@ -509,6 +548,49 @@ def get_supabase_headers():
         "Content-Type": "application/json",
         "Prefer": "return=minimal",
     }
+
+
+async def get_existing_company_names() -> set:
+    """DBに既に保存されている全企業名を取得する（重複除外用）"""
+    if not SUPABASE_URL:
+        return set()
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/companies?select=name"
+        resp = requests.get(url, headers=get_supabase_headers(), timeout=8)
+        data = resp.json()
+        return {d.get("name") for d in data if d.get("name")}
+    except Exception as e:
+        print(f"[get_existing_company_names] error: {e}")
+        return set()
+
+
+async def get_next_page(query_key: str) -> int:
+    """この検索条件で次に取得すべきページ番号を取得する（初回は1）"""
+    if not SUPABASE_URL:
+        return 1
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/search_progress?query_key=eq.{requests.utils.quote(query_key)}"
+        resp = requests.get(url, headers=get_supabase_headers(), timeout=5)
+        data = resp.json()
+        if data:
+            return data[0].get("next_page", 1)
+        return 1
+    except Exception as e:
+        print(f"[get_next_page] error: {e}")
+        return 1
+
+
+async def set_next_page(query_key: str, page: int) -> None:
+    """この検索条件の次回開始ページ番号を保存する"""
+    if not SUPABASE_URL:
+        return
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/search_progress"
+        headers = {**get_supabase_headers(), "Prefer": "resolution=merge-duplicates,return=minimal"}
+        payload = {"query_key": query_key, "next_page": page, "updated_at": datetime.now().isoformat()}
+        requests.post(url, headers=headers, json=payload, timeout=5)
+    except Exception as e:
+        print(f"[set_next_page] error: {e}")
 
 
 async def get_cached_company(name: str):
