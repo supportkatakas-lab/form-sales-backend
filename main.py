@@ -93,8 +93,11 @@ async def search_companies(req: SearchRequest):
                     company["hp"] = guessed_url
                     print(f"[search_companies] guessed url for {company['name']}: {guessed_url}")
                 else:
-                    print(f"[search_companies] skip (no url found): {company.get('name')}")
-                    companies.append(company)  # URLなしでも基本情報だけは表示する
+                    print(f"[search_companies] no url found, saving basic info only: {company.get('name')}")
+                    score_result = rule_based_score(company)  # フォーム情報がないため必ず0点
+                    company.update(score_result)
+                    await save_company(company)
+                    companies.append(company)
                     continue
 
             cached = await get_cached_company(company["name"])
