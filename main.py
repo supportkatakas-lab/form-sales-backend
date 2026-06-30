@@ -62,9 +62,11 @@ async def search_companies(req: SearchRequest):
     if req.employees: query_parts.append(f"従業員{req.employees}名")
     query_parts.append("お問い合わせ 企業")
     query = " ".join(query_parts)
+    print(f"[search_companies] query='{query}'")
 
     # 1. Google検索で企業URLを収集
     urls = await google_search(query, num=15)
+    print(f"[search_companies] found {len(urls)} candidate urls")
 
     # 2. 各URLから企業情報を取得
     companies = []
@@ -86,10 +88,13 @@ async def search_companies(req: SearchRequest):
                     # 6. Supabaseに保存
                     await save_company(company)
                 companies.append(company)
+            else:
+                print(f"[search_companies] skipped (no name extracted): {url}")
         except Exception as e:
-            print(f"Error processing {url}: {e}")
+            print(f"[search_companies] error processing {url}: {type(e).__name__}: {e}")
             continue
 
+    print(f"[search_companies] final company count: {len(companies)}")
     # スコア順に並べて返す
     companies.sort(key=lambda x: x.get("score", 0), reverse=True)
     return {"companies": companies, "total": len(companies)}
@@ -143,26 +148,78 @@ def health_check():
 
 async def google_search(query: str, num: int = 15) -> list[str]:
     """
-    Google検索で企業URLリストを取得する
-    ※ 本番ではGoogle Custom Search API（月100件まで無料）を使う
-    　 まずはduckduckgoの非公式APIでデモ動作
+    企業URLリストを取得する。
+    DuckDuckGoはクラウドサーバーのIPからブロックされやすいため、
+    Bing検索（HTML版）をメインに使用し、失敗時はDuckDuckGoにフォールバックする。
     """
     urls = []
+
+    # ── ① Bing検索を試す ──
+    try:
+        urls = bing_search(query, num)
+        print(f"[search] Bing returned {len(urls)} urls for query='{query}'")
+        if urls:
+            return urls[:num]
+    except Exception as e:
+        print(f"[search] Bing search error: {type(e).__name__}: {e}")
+
+    # ── ② ダメならDuckDuckGoにフォールバック ──
+    try:
+        urls = duckduckgo_search(query, num)
+        print(f"[search] DuckDuckGo returned {len(urls)} urls for query='{query}'")
+    except Exception as e:
+        print(f"[search] DuckDuckGo search error: {type(e).__name__}: {e}")
+
+    return urls[:num]
+
+
+def bing_search(query: str, num: int) -> list[str]:
+    """Bing検索のHTML結果からURLを抽出する"""
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+        "Accept-Language": "ja-JP,ja;q=0.9",
+    }
+    search_url = f"https://www.bing.com/search?q={requests.utils.quote(query)}&count=30"
+    resp = requests.get(search_url, headers=headers, timeout=12)
+    print(f"[bing] status={resp.status_code} length={len(resp.text)}")
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    urls = []
+    skip_domains = ["bing.", "microsoft.", "google.", "wikipedia.", "youtube.",
+                     "twitter.", "x.com", "facebook.", "instagram.", "indeed.com"]
+
+    # Bingの検索結果リンクは <li class="b_algo"> の中の <h2><a href="...">
+    for li in soup.select("li.b_algo"):
+        a = li.find("a", href=True)
+        if not a:
+            continue
+        href = a["href"]
+        if href.startswith("http") and not any(skip in href for skip in skip_domains):
+            urls.append(href)
+
+    return urls[:num]
+
+
+def duckduckgo_search(query: str, num: int) -> list[str]:
+    """DuckDuckGo検索のHTML結果からURLを抽出する（フォールバック用）"""
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
     }
-    try:
-        search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
-        resp = requests.get(search_url, headers=headers, timeout=10)
-        soup = BeautifulSoup(resp.text, "html.parser")
-        for a in soup.select(".result__url")[:num]:
-            href = a.get("href", "")
-            if href.startswith("http") and not any(
-                skip in href for skip in ["google.", "wikipedia.", "youtube.", "twitter.", "facebook."]
-            ):
-                urls.append(href)
-    except Exception as e:
-        print(f"Search error: {e}")
+    search_url = f"https://html.duckduckgo.com/html/?q={requests.utils.quote(query)}"
+    resp = requests.get(search_url, headers=headers, timeout=10)
+    print(f"[ddg] status={resp.status_code} length={len(resp.text)}")
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    urls = []
+    skip_domains = ["google.", "wikipedia.", "youtube.", "twitter.", "facebook."]
+
+    for a in soup.select(".result__a, .result__url"):
+        href = a.get("href", "")
+        if href.startswith("http") and not any(skip in href for skip in skip_domains):
+            urls.append(href)
+
     return urls[:num]
 
 
@@ -223,7 +280,8 @@ async def extract_company_info(url: str, req: SearchRequest) -> Optional[dict]:
             "updated_at": datetime.now().isoformat(),
             "_cached": False,
         }
-    except Exception:
+    except Exception as e:
+        print(f"[extract] failed for {url}: {type(e).__name__}: {e}")
         return None
 
 
